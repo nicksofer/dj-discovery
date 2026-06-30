@@ -1,13 +1,16 @@
 import { useState } from 'react'
 import SearchBar from './components/SearchBar'
 import ArtistCard from './components/ArtistCard'
+import TrackCard from './components/TrackCard'
 import TrackList from './components/TrackList'
+import SimilarTracks from './components/SimilarTracks'
 import RecommendedTracks from './components/RecommendedTracks'
 import MixReadyTracks from './components/MixReadyTracks'
 import SimilarArtists from './components/SimilarArtists'
 import SetBuilder from './components/SetBuilder'
 import { getBpmInfo, sharesBpmCategory } from './utils/bpm'
-import { getMixReadyTracks } from './utils/spotify'
+import { getSpotifyData } from './utils/spotify'
+import { shuffle } from './utils/shuffle'
 import './App.css'
 
 const API_KEY = import.meta.env.VITE_LASTFM_API_KEY
@@ -112,11 +115,19 @@ async function fetchLastFm(method, params) {
 }
 
 export default function App() {
+  const [searchMode, setSearchMode] = useState('artist')
+  // Artist mode state
   const [artist, setArtist] = useState(null)
   const [tracks, setTracks] = useState([])
-  const [similar, setSimilar] = useState([])
   const [recommendations, setRecommendations] = useState([])
-  const [mixReady, setMixReady] = useState({ mainCamelot: null, tracks: [], loading: false })
+  // Track mode state
+  const [selectedTrack, setSelectedTrack] = useState(null)
+  const [similarTracks, setSimilarTracks] = useState([])
+  const [tracksToCheckOut, setTracksToCheckOut] = useState([])
+  // Shared
+  const [similar, setSimilar] = useState([])
+  const [spotifyData, setSpotifyData] = useState(null)
+  const [spotifyLoading, setSpotifyLoading] = useState(false)
   const [foundAs, setFoundAs] = useState(null)
   const [setList, setSetList] = useState([])
   const [loading, setLoading] = useState(false)
@@ -142,11 +153,11 @@ export default function App() {
     setTracks([])
     setSimilar([])
     setRecommendations([])
-    setMixReady({ mainCamelot: null, tracks: [], loading: false })
+    setSpotifyData(null)
+    setSpotifyLoading(false)
     setFoundAs(null)
 
     try {
-      // Step 1: search for the exact artist name to avoid fuzzy-match redirects
       const searchData = await fetchLastFm('artist.search', `artist=${encodeURIComponent(name)}&limit=1`)
       const topMatch = searchData.results?.artistmatches?.artist?.[0]
       if (!topMatch) throw new Error('Artist not found')
@@ -154,70 +165,151 @@ export default function App() {
       const exactName = topMatch.name
       if (exactName.toLowerCase() !== name.toLowerCase()) setFoundAs(exactName)
 
-      // Step 2: fetch info, tracks, similar artists, and Wikipedia thumbnail in parallel
-      const [infoData, tracksData, similarData, wikiData] = await Promise.all([
+      // Fetch 20 similar artists so we have a real pool to filter and shuffle
+      const [infoData, tracksData, similarData] = await Promise.all([
         fetchLastFm('artist.getinfo', `artist=${encodeURIComponent(exactName)}`),
         fetchLastFm('artist.gettoptracks', `artist=${encodeURIComponent(exactName)}&limit=8`),
-        fetchLastFm('artist.getsimilar', `artist=${encodeURIComponent(exactName)}&limit=10`),
-        fetch(`https://en.wikipedia.org/api/rest_v1/page/summary/${encodeURIComponent(exactName)}`).then(r => r.json()).catch(() => null),
+        fetchLastFm('artist.getsimilar', `artist=${encodeURIComponent(exactName)}&limit=20`),
       ])
 
       if (infoData.error) throw new Error('Artist not found')
 
-      const wikiImage = wikiData?.thumbnail?.source ?? null
-      const artistData = { ...infoData.artist, wikiImage }
-      const allTags = artistData.tags?.tag?.map(t => t.name) ?? []
-      const bpmInfo = getBpmInfo(allTags)
-
+      const artistData = infoData.artist
+      const allTags    = artistData.tags?.tag?.map(t => t.name) ?? []
+      const bpmInfo    = getBpmInfo(allTags)
       const allSimilar = similarData.similarartists?.artist ?? []
 
-      // Step 3: fetch each similar artist's tags so we can filter by genre compatibility
+      // Fetch tags for the full pool so we can filter accurately
       const similarInfoResults = await Promise.all(
-        allSimilar.slice(0, 10).map(a =>
+        allSimilar.slice(0, 20).map(a =>
           fetchLastFm('artist.getinfo', `artist=${encodeURIComponent(a.name)}`)
         )
       )
 
-      // Keep only similar artists that share a BPM/genre category with the main artist.
-      // If the main artist has no known genre, include all (we can't filter without a reference).
-      const compatibleSimilar = allSimilar.filter((_, i) => {
+      // Filter by genre compatibility, then shuffle so each search returns a different subset
+      const compatiblePool = allSimilar.filter((_, i) => {
         if (!bpmInfo) return true
         const simTags = similarInfoResults[i]?.artist?.tags?.tag?.map(t => t.name) ?? []
         return sharesBpmCategory(allTags, simTags)
-      }).slice(0, 6)
+      })
+      const compatibleSimilar = shuffle(compatiblePool).slice(0, 6)
 
-      // Step 4: fetch top 3 tracks from each compatible similar artist.
-      // We use this single fetch for both sections:
-      //   - "Recommended Tracks" = the #1 track from each artist (curated picks)
-      //   - "Popular in [genre]" = all tracks pooled and sorted by play count,
-      //     so every result is genuinely from the same scene — not a generic genre chart.
-      const similarTracksResults = await Promise.all(
-        compatibleSimilar.slice(0, 6).map(a =>
-          fetchLastFm('artist.gettoptracks', `artist=${encodeURIComponent(a.name)}&limit=1`)
+      // Fetch 3 tracks per artist — randomly pick one so recs vary between searches
+      const recTrackResults = await Promise.all(
+        compatibleSimilar.slice(0, 5).map(a =>
+          fetchLastFm('artist.gettoptracks', `artist=${encodeURIComponent(a.name)}&limit=3`)
         )
       )
 
       const recs = compatibleSimilar.slice(0, 5).map((a, i) => {
-        const track = similarTracksResults[i]?.toptracks?.track?.[0]
-        const albumArt = track?.image?.find(img => img.size === 'medium')?.['#text'] || null
-        return track
-          ? { artist: a.name, track: track.name, bpmRange: bpmInfo?.range ?? null, albumArt }
-          : null
+        const topTracks = recTrackResults[i]?.toptracks?.track ?? []
+        if (!topTracks.length) return null
+        // Randomly pick from the top 3 — biased toward #1 but not deterministic
+        const pick = topTracks[Math.floor(Math.random() * Math.min(topTracks.length, 3))]
+        return { artist: a.name, track: pick.name, bpmRange: bpmInfo?.range ?? null }
       }).filter(Boolean)
 
+      const mainTracks = tracksData.toptracks?.track ?? []
+
       setArtist(artistData)
-      setTracks(tracksData.toptracks?.track ?? [])
+      setTracks(mainTracks)
       setSimilar(compatibleSimilar)
       setRecommendations(recs)
 
-      // Fire Spotify key-matching asynchronously so main content renders immediately
-      const topTrackName = tracksData.toptracks?.track?.[0]?.name
+      // Spotify enrichment fires async — images and key data arrive after main content renders
+      const topTrackName = mainTracks[0]?.name
       if (topTrackName) {
-        setMixReady({ mainCamelot: null, tracks: [], loading: true })
-        getMixReadyTracks(exactName, topTrackName, compatibleSimilar)
-          .then(data => setMixReady({ ...data, loading: false }))
-          .catch(() => setMixReady({ mainCamelot: null, tracks: [], loading: false }))
+        setSpotifyLoading(true)
+        getSpotifyData(exactName, topTrackName, compatibleSimilar, recs, [], mainTracks)
+          .then(data => { setSpotifyData(data); setSpotifyLoading(false) })
+          .catch(() => setSpotifyLoading(false))
       }
+    } catch (e) {
+      setError(e.message)
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  function switchMode(mode) {
+    setSearchMode(mode)
+    setArtist(null); setTracks([]); setRecommendations([])
+    setSelectedTrack(null); setSimilarTracks([]); setTracksToCheckOut([])
+    setSimilar([]); setSpotifyData(null); setSpotifyLoading(false)
+    setError(null); setFoundAs(null)
+  }
+
+  async function handleTrackSearch(name) {
+    setLoading(true)
+    setError(null)
+    setSelectedTrack(null); setSimilarTracks([]); setTracksToCheckOut([])
+    setSimilar([]); setSpotifyData(null); setSpotifyLoading(false); setFoundAs(null)
+
+    try {
+      const searchData = await fetchLastFm('track.search', `track=${encodeURIComponent(name)}&limit=1`)
+      const topMatch = searchData.results?.trackmatches?.track?.[0]
+      if (!topMatch) throw new Error('Track not found')
+
+      const exactTrack = topMatch.name
+      const artistName = topMatch.artist
+      if (exactTrack.toLowerCase() !== name.toLowerCase()) setFoundAs(`${exactTrack} — ${artistName}`)
+
+      // Fetch 20 similar tracks and 20 similar artists for larger shuffle pools
+      const [infoData, similarTracksData, similarArtistsData] = await Promise.all([
+        fetchLastFm('track.getInfo', `track=${encodeURIComponent(exactTrack)}&artist=${encodeURIComponent(artistName)}&autocorrect=1`),
+        fetchLastFm('track.getSimilar', `track=${encodeURIComponent(exactTrack)}&artist=${encodeURIComponent(artistName)}&limit=20`),
+        fetchLastFm('artist.getSimilar', `artist=${encodeURIComponent(artistName)}&limit=20`),
+      ])
+
+      const trackData = infoData.track
+      if (!trackData) throw new Error('Track not found')
+
+      const allTags = trackData.toptags?.tag?.map(t => t.name) ?? []
+      const bpmInfo = getBpmInfo(allTags)
+
+      const allSimilarArtists = similarArtistsData.similarartists?.artist ?? []
+
+      const similarArtistInfos = await Promise.all(
+        allSimilarArtists.slice(0, 20).map(a =>
+          fetchLastFm('artist.getinfo', `artist=${encodeURIComponent(a.name)}`)
+        )
+      )
+
+      // Filter by genre, shuffle for variety, take 6
+      const compatiblePool = allSimilarArtists.filter((_, i) => {
+        if (!bpmInfo) return true
+        const simTags = similarArtistInfos[i]?.artist?.tags?.tag?.map(t => t.name) ?? []
+        return sharesBpmCategory(allTags, simTags)
+      })
+      const compatibleArtists = shuffle(compatiblePool).slice(0, 6)
+
+      // Fetch 3 tracks per artist, randomly pick one
+      const artistTrackResults = await Promise.all(
+        compatibleArtists.slice(0, 5).map(a =>
+          fetchLastFm('artist.gettoptracks', `artist=${encodeURIComponent(a.name)}&limit=3`)
+        )
+      )
+      const tracksToCheck = compatibleArtists.slice(0, 5).map((a, i) => {
+        const topTracks = artistTrackResults[i]?.toptracks?.track ?? []
+        if (!topTracks.length) return null
+        const pick = topTracks[Math.floor(Math.random() * Math.min(topTracks.length, 3))]
+        return { artist: a.name, track: pick.name, bpmRange: bpmInfo?.range ?? null }
+      }).filter(Boolean)
+
+      // Shuffle similar tracks so the 8 shown vary between searches
+      const rawSimilarTracks = similarTracksData.similartracks?.track ?? []
+      const displayedSimilarTracks = shuffle(rawSimilarTracks.slice(0, 15)).slice(0, 8)
+
+      setSelectedTrack(trackData)
+      setSimilarTracks(displayedSimilarTracks)
+      setSimilar(compatibleArtists)
+      setTracksToCheckOut(tracksToCheck)
+
+      setSpotifyLoading(true)
+      getSpotifyData(artistName, exactTrack, compatibleArtists, tracksToCheck, displayedSimilarTracks)
+        .then(data => { setSpotifyData(data); setSpotifyLoading(false) })
+        .catch(() => setSpotifyLoading(false))
+
     } catch (e) {
       setError(e.message)
     } finally {
@@ -244,35 +336,82 @@ export default function App() {
       </header>
 
       <main className="app">
-        <SearchBar onSearch={handleSearch} loading={loading} />
+        <div className="mode-toggle">
+          <button className={`mode-btn${searchMode === 'artist' ? ' active' : ''}`} onClick={() => switchMode('artist')}>Artist</button>
+          <button className={`mode-btn${searchMode === 'track' ? ' active' : ''}`} onClick={() => switchMode('track')}>Track</button>
+        </div>
+
+        <SearchBar
+          onSearch={searchMode === 'artist' ? handleSearch : handleTrackSearch}
+          loading={loading}
+          placeholder={searchMode === 'artist' ? 'Search for an artist or DJ...' : 'Search for a song...'}
+        />
 
         {error && <p className="error">{error}</p>}
 
         {foundAs && (
-          <p className="found-as">No exact match found — showing results for <strong>{foundAs}</strong></p>
+          <p className="found-as">Showing results for <strong>{foundAs}</strong></p>
         )}
 
-        {artist && (
+        {searchMode === 'artist' && artist && (
           <>
-            <ArtistCard artist={artist} />
+            <ArtistCard artist={artist} artistImageUrl={spotifyData?.artistImageUrl} />
             <TrackList
               tracks={tracks}
               artistName={artist.name}
               bpmRange={bpmInfo?.range}
+              trackImages={spotifyData?.trackImages}
               onAddToSet={addToSet}
             />
             <RecommendedTracks
               recommendations={recommendations}
+              recImages={spotifyData?.recImages}
               onSearch={handleSearch}
               onAddToSet={addToSet}
             />
             <MixReadyTracks
-              mainCamelot={mixReady.mainCamelot}
-              tracks={mixReady.tracks}
-              loading={mixReady.loading}
+              mainCamelot={spotifyData?.mainCamelot ?? null}
+              tracks={spotifyData?.mixTracks ?? []}
+              loading={spotifyLoading}
               onAddToSet={addToSet}
             />
             <SimilarArtists artists={similar} onSearch={handleSearch} />
+          </>
+        )}
+
+        {searchMode === 'track' && selectedTrack && (
+          <>
+            <TrackCard
+              track={selectedTrack}
+              camelot={spotifyData?.mainCamelot ?? null}
+              trackImageUrl={spotifyData?.trackImageUrl ?? null}
+              onSearchArtist={name => { switchMode('artist'); handleSearch(name) }}
+              onAddToSet={addToSet}
+            />
+            <MixReadyTracks
+              mainCamelot={spotifyData?.mainCamelot ?? null}
+              tracks={spotifyData?.mixTracks ?? []}
+              loading={spotifyLoading}
+              onAddToSet={addToSet}
+            />
+            <SimilarTracks
+              tracks={similarTracks}
+              similarTrackImages={spotifyData?.similarTrackImages}
+              onSearchArtist={name => { switchMode('artist'); handleSearch(name) }}
+              onAddToSet={addToSet}
+            />
+            <RecommendedTracks
+              recommendations={tracksToCheckOut}
+              recImages={spotifyData?.recImages}
+              onSearch={name => { switchMode('artist'); handleSearch(name) }}
+              onAddToSet={addToSet}
+              title="Tracks to Check Out"
+              subtitle="Top picks from artists with a similar sound"
+            />
+            <SimilarArtists
+              artists={similar}
+              onSearch={name => { switchMode('artist'); handleSearch(name) }}
+            />
           </>
         )}
 

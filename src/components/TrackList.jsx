@@ -1,6 +1,6 @@
 import StreamingButton from './StreamingButton'
 
-export default function TrackList({ tracks, artistName, bpmRange, onAddToSet }) {
+export default function TrackList({ tracks, artistName, bpmRange, trackImages, onAddToSet }) {
   if (!tracks?.length) return null
 
   return (
@@ -8,7 +8,7 @@ export default function TrackList({ tracks, artistName, bpmRange, onAddToSet }) 
       <h3>Top Tracks</h3>
       <ul className="track-list">
         {tracks.slice(0, 8).map((track, i) => {
-          const albumArt = track.image?.find(img => img.size === 'medium')?.['#text'] || null
+          const albumArt = trackImages?.[track.name.toLowerCase()] ?? null
           return (
             <li key={track.name} className="track-item">
               <span className="track-number">{i + 1}</span>

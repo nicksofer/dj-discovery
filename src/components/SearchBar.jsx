@@ -1,6 +1,6 @@
 import { useState } from 'react'
 
-export default function SearchBar({ onSearch, loading }) {
+export default function SearchBar({ onSearch, loading, placeholder = 'Search an artist or DJ...' }) {
   const [input, setInput] = useState('')
 
   function handleSubmit(e) {
@@ -12,7 +12,7 @@ export default function SearchBar({ onSearch, loading }) {
     <form className="search-bar" onSubmit={handleSubmit}>
       <input
         type="text"
-        placeholder="Search an artist or DJ..."
+        placeholder={placeholder}
         value={input}
         onChange={e => setInput(e.target.value)}
       />
