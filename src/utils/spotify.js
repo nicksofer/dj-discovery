@@ -1,16 +1,32 @@
-const ACCOUNTS_URL = 'https://accounts.spotify.com/api/token'
-const API_BASE = 'https://api.spotify.com/v1'
+// ── iTunes image API (free, no auth, CORS-enabled) ────────────────────────
+const ITUNES = 'https://itunes.apple.com/search'
 
-let _cache = null
+async function itunesSearch(term) {
+  try {
+    const res = await fetch(`${ITUNES}?term=${encodeURIComponent(term)}&media=music&entity=song&limit=3`)
+    if (!res.ok) return []
+    const data = await res.json()
+    return data.results ?? []
+  } catch {
+    return []
+  }
+}
+
+// Scale iTunes artwork from the default 100x100 to a useful size
+function art(url, size = 400) {
+  return url ? url.replace(/\d+x\d+bb/, `${size}x${size}bb`) : null
+}
+
+// ── Spotify token (cached, for Camelot key detection only) ────────────────
+const ACCOUNTS_URL = 'https://accounts.spotify.com/api/token'
+const API_BASE     = 'https://api.spotify.com/v1'
+let _tokenCache    = null
 
 async function getToken() {
-  if (_cache?.expiresAt > Date.now()) return _cache.token
+  if (_tokenCache?.expiresAt > Date.now()) return _tokenCache.token
   const id     = import.meta.env.VITE_SPOTIFY_CLIENT_ID
   const secret = import.meta.env.VITE_SPOTIFY_CLIENT_SECRET
-  if (!id || !secret) {
-    console.warn('[Spotify] Missing credentials — add VITE_SPOTIFY_CLIENT_ID and VITE_SPOTIFY_CLIENT_SECRET to .env')
-    return null
-  }
+  if (!id || !secret) return null
   try {
     const res = await fetch(ACCOUNTS_URL, {
       method: 'POST',
@@ -20,19 +36,28 @@ async function getToken() {
       },
       body: 'grant_type=client_credentials',
     })
-    if (!res.ok) {
-      console.warn('[Spotify] Token request failed:', res.status)
-      return null
-    }
+    if (!res.ok) return null
     const { access_token, expires_in } = await res.json()
-    _cache = { token: access_token, expiresAt: Date.now() + (expires_in - 60) * 1000 }
-    return _cache.token
-  } catch (e) {
-    console.error('[Spotify] Token fetch error:', e)
+    _tokenCache = { token: access_token, expiresAt: Date.now() + (expires_in - 60) * 1000 }
+    return _tokenCache.token
+  } catch {
     return null
   }
 }
 
+async function apiFetch(path, token) {
+  try {
+    const res = await fetch(`${API_BASE}${path}`, {
+      headers: { Authorization: `Bearer ${token}` },
+    })
+    if (!res.ok) return null
+    return res.json()
+  } catch {
+    return null
+  }
+}
+
+// ── Camelot wheel ─────────────────────────────────────────────────────────
 const CAMELOT = [
   ['5A', '8B'],  // C
   ['12A', '3B'], // C#/Db
@@ -55,29 +80,16 @@ export function toCamelot(key, mode) {
 
 export function compatibleKeys(camelot) {
   if (!camelot) return null
-  const num  = parseInt(camelot, 10)
+  const num    = parseInt(camelot, 10)
   const letter = camelot.slice(-1)
-  const opp  = letter === 'A' ? 'B' : 'A'
-  const prev = ((num - 2 + 12) % 12) + 1
-  const next = (num % 12) + 1
+  const opp    = letter === 'A' ? 'B' : 'A'
+  const prev   = ((num - 2 + 12) % 12) + 1
+  const next   = (num % 12) + 1
   return new Set([camelot, `${num}${opp}`, `${prev}${letter}`, `${next}${letter}`])
 }
 
 export function spotifyConfigured() {
   return !!(import.meta.env.VITE_SPOTIFY_CLIENT_ID && import.meta.env.VITE_SPOTIFY_CLIENT_SECRET)
-}
-
-// Each call is independent — a failed search returns null and doesn't break the batch
-async function apiFetch(path, token) {
-  try {
-    const res = await fetch(`${API_BASE}${path}`, {
-      headers: { Authorization: `Bearer ${token}` },
-    })
-    if (!res.ok) return null
-    return res.json()
-  } catch {
-    return null
-  }
 }
 
 function shuffle(arr) {
@@ -89,20 +101,12 @@ function shuffle(arr) {
   return a
 }
 
-// spotifyQ: build a Spotify search query string, quoting each term
-function sq(track, artist) {
-  return encodeURIComponent(`track:"${track}" artist:"${artist}"`)
-}
-
 /**
- * getSpotifyData — consolidated enrichment call.
+ * getSpotifyData
  *
- * @param {string}   mainArtistName
- * @param {string}   mainTopTrackName  — the primary track to get the Camelot key from
- * @param {Array}    similarArtists    — array of { name } (Last.fm similar artists)
- * @param {Array}    recs              — array of { artist, track } for "Tracks to Check Out"
- * @param {Array}    similarTracks     — array of { name, artist } from track.getSimilar
- * @param {Array}    mainTracks        — Last.fm top tracks for the main artist (for TrackList art)
+ * Images come from Apple's iTunes Search API (free, no account needed).
+ * Camelot key + mix-ready tracks come from Spotify (requires Premium on
+ * the developer account — gracefully returns empty when unavailable).
  */
 export async function getSpotifyData(
   mainArtistName,
@@ -112,127 +116,110 @@ export async function getSpotifyData(
   similarTracks = [],
   mainTracks    = [],
 ) {
-  const token = await getToken()
-  if (!token) return null
+  const nSim     = Math.min(similarArtists.length, 5)
+  const nRecs    = recs.length
+  const nSimTrk  = Math.min(similarTracks.length, 8)
+  const nMainTrk = Math.min(mainTracks.length, 8)
 
   try {
-    const nSim      = Math.min(similarArtists.length, 5)
-    const nRecs     = recs.length
-    const nSimTrk   = Math.min(similarTracks.length, 8)
-    const nMainTrk  = Math.min(mainTracks.length, 8)
-
-    // ── Phase 1: all searches in parallel ──────────────────────────────────
-    // Index map:
-    //  0              → artist search (profile image)
-    //  1              → main track search (album art + audio-features ID)
-    //  2..2+nSim      → similar artist track searches (mix section)
-    //  +nRecs         → rec track searches (art for "Tracks to Check Out")
-    //  +nSimTrk       → similar track art
-    //  +nMainTrk      → main artist individual track art (keys match Last.fm names)
-    const results = await Promise.all([
-      apiFetch(`/search?q=${encodeURIComponent(`artist:"${mainArtistName}"`)}&type=artist&limit=1`, token),
-      apiFetch(`/search?q=${sq(mainTopTrackName, mainArtistName)}&type=track&limit=1`, token),
-      ...similarArtists.slice(0, nSim).map(a =>
-        apiFetch(`/search?q=${encodeURIComponent(`artist:"${a.name}"`)}&type=track&limit=10`, token)
-      ),
-      ...recs.map(r =>
-        apiFetch(`/search?q=${sq(r.track, r.artist)}&type=track&limit=1`, token)
-      ),
-      ...similarTracks.slice(0, nSimTrk).map(t => {
-        const artist = t.artist?.name ?? t.artist ?? ''
-        return apiFetch(`/search?q=${sq(t.name, artist)}&type=track&limit=1`, token)
-      }),
+    // ── Phase 1: fetch all images from iTunes in parallel ────────────────
+    const itunesResults = await Promise.all([
+      // 0: artist profile image — album art of their top track
+      itunesSearch(`${mainTopTrackName} ${mainArtistName}`),
+      // 1: searched track image (for TrackCard in track mode)
+      itunesSearch(`${mainTopTrackName} ${mainArtistName}`),
+      // 2..2+nMainTrk: each of the main artist's top tracks
       ...mainTracks.slice(0, nMainTrk).map(t =>
-        apiFetch(`/search?q=${sq(t.name, mainArtistName)}&type=track&limit=1`, token)
+        itunesSearch(`${t.name} ${mainArtistName}`)
       ),
+      // 2+nMainTrk..+nRecs: rec tracks
+      ...recs.map(r => itunesSearch(`${r.track} ${r.artist}`)),
+      // ..+nSimTrk: similar tracks
+      ...similarTracks.slice(0, nSimTrk).map(t => {
+        const a = t.artist?.name ?? t.artist ?? ''
+        return itunesSearch(`${t.name} ${a}`)
+      }),
     ])
 
     let idx = 0
-    const artistSearch      = results[idx++]
-    const mainTrackSearch   = results[idx++]
-    const simArtistSearches = results.slice(idx, (idx += nSim))
-    const recSearches       = results.slice(idx, (idx += nRecs))
-    const simTrkSearches    = results.slice(idx, (idx += nSimTrk))
-    const mainTrkSearches   = results.slice(idx, (idx += nMainTrk))
+    const artistImgRes  = itunesResults[idx++]
+    const trackImgRes   = itunesResults[idx++]
+    const mainTrkRes    = itunesResults.slice(idx, (idx += nMainTrk))
+    const recRes        = itunesResults.slice(idx, (idx += nRecs))
+    const simTrkRes     = itunesResults.slice(idx, (idx += nSimTrk))
 
-    // Artist profile image (largest available)
-    const spotifyArtist  = artistSearch?.artists?.items?.[0]
-    const artistImageUrl = spotifyArtist?.images?.[0]?.url
-      ?? spotifyArtist?.images?.[1]?.url
-      ?? null
+    // Artist card image: album art of their top track (best available proxy)
+    const artistImageUrl = art(artistImgRes?.[0]?.artworkUrl100, 400) ?? null
 
-    // Main track album art
-    const mainSpotifyTrack = mainTrackSearch?.tracks?.items?.[0]
-    const trackImageUrl    = mainSpotifyTrack?.album?.images?.[0]?.url
-      ?? mainSpotifyTrack?.album?.images?.[1]?.url
-      ?? null
+    // TrackCard image
+    const trackImageUrl  = art(trackImgRes?.[0]?.artworkUrl100, 300) ?? null
 
-    // Similar artist tracks (pool for mix section)
-    const simArtistTracks = simArtistSearches.flatMap((data, i) =>
-      (data?.tracks?.items ?? []).map(t => ({
-        ...t,
-        _artistName: similarArtists[i]?.name,
-      }))
-    )
-
-    // Rec album art keyed by "artist|||track"
-    const recImages = {}
-    recs.forEach((r, i) => {
-      const t   = recSearches[i]?.tracks?.items?.[0]
-      const art = t?.album?.images?.[1]?.url ?? t?.album?.images?.[0]?.url ?? null
-      if (art) recImages[`${r.artist}|||${r.track}`.toLowerCase()] = art
-    })
-
-    // Similar track art keyed by "artist|||track"
-    const similarTrackImages = {}
-    similarTracks.slice(0, nSimTrk).forEach((t, i) => {
-      const artist   = t.artist?.name ?? t.artist ?? ''
-      const spotTrack = simTrkSearches[i]?.tracks?.items?.[0]
-      const art = spotTrack?.album?.images?.[1]?.url ?? spotTrack?.album?.images?.[0]?.url ?? null
-      if (art) similarTrackImages[`${artist}|||${t.name}`.toLowerCase()] = art
-    })
-
-    // Main artist track art keyed by Last.fm track name — ensures exact match
+    // TrackList album art keyed by Last.fm track name (exact match guaranteed)
     const trackImages = {}
     mainTracks.slice(0, nMainTrk).forEach((t, i) => {
-      const spotTrack = mainTrkSearches[i]?.tracks?.items?.[0]
-      const art = spotTrack?.album?.images?.[1]?.url ?? spotTrack?.album?.images?.[0]?.url ?? null
-      if (art) trackImages[t.name.toLowerCase()] = art
+      const a = art(mainTrkRes[i]?.[0]?.artworkUrl100, 150)
+      if (a) trackImages[t.name.toLowerCase()] = a
     })
 
-    // ── Phase 2: audio-features for mix section ────────────────────────────
-    const mainTrackId = mainSpotifyTrack?.id
-    const allIds = [mainTrackId, ...simArtistTracks.map(t => t.id)].filter(Boolean).join(',')
-    const featData = allIds
-      ? await apiFetch(`/audio-features?ids=${allIds}`, token)
-      : null
+    // Rec album art
+    const recImages = {}
+    recs.forEach((r, i) => {
+      const a = art(recRes[i]?.[0]?.artworkUrl100, 150)
+      if (a) recImages[`${r.artist}|||${r.track}`.toLowerCase()] = a
+    })
 
-    const allFeatures = featData?.audio_features ?? []
-    const mainFeat    = mainTrackId ? allFeatures[0] : null
-    const mainCamelot = toCamelot(mainFeat?.key, mainFeat?.mode)
-    const compatible  = compatibleKeys(mainCamelot)
-    const simFeatures = mainTrackId ? allFeatures.slice(1) : allFeatures
+    // Similar track album art
+    const similarTrackImages = {}
+    similarTracks.slice(0, nSimTrk).forEach((t, i) => {
+      const artist = t.artist?.name ?? t.artist ?? ''
+      const a = art(simTrkRes[i]?.[0]?.artworkUrl100, 150)
+      if (a) similarTrackImages[`${artist}|||${t.name}`.toLowerCase()] = a
+    })
 
-    // Key-compatible tracks sorted by popularity, then shuffled within the top pool
-    // so results vary every search while staying high-quality
-    const qualified = simArtistTracks
-      .map((t, i) => {
-        const feat    = simFeatures[i]
-        const camelot = toCamelot(feat?.key, feat?.mode)
-        return {
-          trackName:  t.name,
-          artistName: t._artistName,
-          camelot,
-          albumArt:   t.album?.images?.[1]?.url ?? t.album?.images?.[0]?.url ?? null,
-          popularity: t.popularity ?? 0,
-        }
-      })
-      .filter(t => !compatible || compatible.has(t.camelot))
-      .sort((a, b) => b.popularity - a.popularity)
+    // ── Phase 2: Spotify Camelot + mix-ready (requires Spotify Premium) ──
+    // Gracefully returns nothing if the API is unavailable (403, no token, etc.)
+    let mainCamelot = null
+    let mixTracks   = []
 
-    // Shuffle within the top-20 quality pool so each search surfaces different picks
-    const pool      = qualified.slice(0, 20)
-    const mixTracks = shuffle(pool).slice(0, 8)
+    const token = await getToken()
+    if (token) {
+      const spotResults = await Promise.all([
+        apiFetch(`/search?q=${encodeURIComponent(`${mainTopTrackName} ${mainArtistName}`)}&type=track&limit=1`, token),
+        ...similarArtists.slice(0, nSim).map(a =>
+          apiFetch(`/search?q=${encodeURIComponent(a.name)}&type=track&limit=10`, token)
+        ),
+      ])
+
+      const mainSpotTrack  = spotResults[0]?.tracks?.items?.[0]
+      const simArtistTracks = spotResults.slice(1).flatMap((data, i) =>
+        (data?.tracks?.items ?? []).map(t => ({ ...t, _artistName: similarArtists[i]?.name }))
+      )
+
+      const mainTrackId = mainSpotTrack?.id
+      const allIds = [mainTrackId, ...simArtistTracks.map(t => t.id)].filter(Boolean).join(',')
+
+      if (allIds) {
+        const featData    = await apiFetch(`/audio-features?ids=${allIds}`, token)
+        const allFeatures = featData?.audio_features ?? []
+        const mainFeat    = mainTrackId ? allFeatures[0] : null
+        mainCamelot       = toCamelot(mainFeat?.key, mainFeat?.mode)
+        const compatible  = compatibleKeys(mainCamelot)
+        const simFeatures = mainTrackId ? allFeatures.slice(1) : allFeatures
+
+        const qualified = simArtistTracks
+          .map((t, i) => ({
+            trackName:  t.name,
+            artistName: t._artistName,
+            camelot:    toCamelot(simFeatures[i]?.key, simFeatures[i]?.mode),
+            albumArt:   t.album?.images?.[1]?.url ?? t.album?.images?.[0]?.url ?? null,
+            popularity: t.popularity ?? 0,
+          }))
+          .filter(t => !compatible || compatible.has(t.camelot))
+          .sort((a, b) => b.popularity - a.popularity)
+
+        mixTracks = shuffle(qualified.slice(0, 20)).slice(0, 8)
+      }
+    }
 
     return {
       mainCamelot,
@@ -244,7 +231,7 @@ export async function getSpotifyData(
       similarTrackImages,
     }
   } catch (e) {
-    console.error('[Spotify] getSpotifyData error:', e)
+    console.error('[getSpotifyData] error:', e)
     return null
   }
 }
