@@ -122,19 +122,21 @@ export async function getSpotifyData(
   const nMainTrk = Math.min(mainTracks.length, 8)
 
   try {
-    // ── Phase 1: fetch all images from iTunes in parallel ────────────────
-    const itunesResults = await Promise.all([
-      // 0: artist profile image — album art of their top track
+    // ── Phase 1: images in parallel — Deezer for artist photo, iTunes for album art ──
+    const [deezerArtist, ...itunesResults] = await Promise.all([
+      // Deezer: actual artist headshot / press photo
+      fetch(`https://api.deezer.com/search/artist?q=${encodeURIComponent(mainArtistName)}&limit=1`)
+        .then(r => r.ok ? r.json() : null)
+        .catch(() => null),
+      // iTunes: track image (for TrackCard in track mode)
       itunesSearch(`${mainTopTrackName} ${mainArtistName}`),
-      // 1: searched track image (for TrackCard in track mode)
-      itunesSearch(`${mainTopTrackName} ${mainArtistName}`),
-      // 2..2+nMainTrk: each of the main artist's top tracks
+      // Each of the main artist's top tracks
       ...mainTracks.slice(0, nMainTrk).map(t =>
         itunesSearch(`${t.name} ${mainArtistName}`)
       ),
-      // 2+nMainTrk..+nRecs: rec tracks
+      // Rec tracks
       ...recs.map(r => itunesSearch(`${r.track} ${r.artist}`)),
-      // ..+nSimTrk: similar tracks
+      // Similar tracks
       ...similarTracks.slice(0, nSimTrk).map(t => {
         const a = t.artist?.name ?? t.artist ?? ''
         return itunesSearch(`${t.name} ${a}`)
@@ -142,14 +144,18 @@ export async function getSpotifyData(
     ])
 
     let idx = 0
-    const artistImgRes  = itunesResults[idx++]
-    const trackImgRes   = itunesResults[idx++]
-    const mainTrkRes    = itunesResults.slice(idx, (idx += nMainTrk))
-    const recRes        = itunesResults.slice(idx, (idx += nRecs))
-    const simTrkRes     = itunesResults.slice(idx, (idx += nSimTrk))
+    const trackImgRes = itunesResults[idx++]
+    const mainTrkRes  = itunesResults.slice(idx, (idx += nMainTrk))
+    const recRes      = itunesResults.slice(idx, (idx += nRecs))
+    const simTrkRes   = itunesResults.slice(idx, (idx += nSimTrk))
 
-    // Artist card image: album art of their top track (best available proxy)
-    const artistImageUrl = art(artistImgRes?.[0]?.artworkUrl100, 400) ?? null
+    // Artist photo: Deezer press photo (500x500), fall back to iTunes album art
+    const deezerMatch  = deezerArtist?.data?.[0]
+    const artistImageUrl =
+      deezerMatch?.picture_big                                    // 500x500 real photo
+      ?? deezerMatch?.picture_medium                              // 250x250
+      ?? art(trackImgRes?.[0]?.artworkUrl100, 400)               // iTunes album art fallback
+      ?? null
 
     // TrackCard image
     const trackImageUrl  = art(trackImgRes?.[0]?.artworkUrl100, 300) ?? null
