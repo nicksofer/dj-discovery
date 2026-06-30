@@ -17,6 +17,44 @@ function art(url, size = 400) {
   return url ? url.replace(/\d+x\d+bb/, `${size}x${size}bb`) : null
 }
 
+// ── Artist photo helpers ───────────────────────────────────────────────────
+
+// TheAudioDB: real press photos, CORS-enabled, ~60% coverage
+async function audioDbPhoto(name) {
+  try {
+    const r = await fetch(`https://www.theaudiodb.com/api/v1/json/2/search.php?s=${encodeURIComponent(name)}`)
+    if (!r.ok) return null
+    const d = await r.json()
+    return d.artists?.[0]?.strArtistThumb ?? null
+  } catch {
+    return null
+  }
+}
+
+// Wikipedia: CORS-enabled via origin=*, covers artists with Wikipedia pages.
+// Strict title-match prevents returning photos of the wrong person.
+async function wikipediaPhoto(name) {
+  try {
+    const q = encodeURIComponent(`${name} musician DJ producer`)
+    const r = await fetch(
+      `https://en.wikipedia.org/w/api.php?action=query&generator=search&gsrsearch=${q}&gsrlimit=5&prop=pageimages&pithumbsize=500&format=json&origin=*`
+    )
+    if (!r.ok) return null
+    const d = await r.json()
+    const pages = Object.values(d.query?.pages ?? {})
+    const norm  = name.toLowerCase().replace(/[^a-z0-9 ]/g, '').trim()
+    // Only accept an article whose title clearly refers to this artist
+    const hit = pages.find(p => {
+      if (!p.thumbnail || p.pageid < 1) return false
+      const title = p.title.toLowerCase().replace(/[^a-z0-9 ]/g, '')
+      return title.includes(norm) || norm.includes(title)
+    })
+    return hit?.thumbnail?.source ?? null
+  } catch {
+    return null
+  }
+}
+
 // ── Spotify token (cached, for Camelot key detection only) ────────────────
 const ACCOUNTS_URL = 'https://accounts.spotify.com/api/token'
 const API_BASE     = 'https://api.spotify.com/v1'
@@ -122,12 +160,12 @@ export async function getSpotifyData(
   const nMainTrk = Math.min(mainTracks.length, 8)
 
   try {
-    // ── Phase 1: images in parallel — Deezer for artist photo, iTunes for album art ──
-    const [audioDbResult, ...itunesResults] = await Promise.all([
-      // TheAudioDB: actual artist headshot — CORS-enabled, free, no auth
-      fetch(`https://www.theaudiodb.com/api/v1/json/2/search.php?s=${encodeURIComponent(mainArtistName)}`)
-        .then(r => r.ok ? r.json() : null)
-        .catch(() => null),
+    // ── Phase 1: all image fetches in parallel ───────────────────────────
+    // Artist photo: TheAudioDB (~60% coverage) + Wikipedia fallback (~+25%) run
+    // simultaneously so there's no extra latency when TheAudioDB misses.
+    const [adbPhoto, wikiPhoto, ...itunesResults] = await Promise.all([
+      audioDbPhoto(mainArtistName),
+      wikipediaPhoto(mainArtistName),
       // iTunes: track image (for TrackCard in track mode)
       itunesSearch(`${mainTopTrackName} ${mainArtistName}`),
       // Each of the main artist's top tracks
@@ -149,11 +187,11 @@ export async function getSpotifyData(
     const recRes      = itunesResults.slice(idx, (idx += nRecs))
     const simTrkRes   = itunesResults.slice(idx, (idx += nSimTrk))
 
-    // Artist photo: TheAudioDB headshot, fall back to iTunes album art
-    const audioDbArtist  = audioDbResult?.artists?.[0]
+    // Priority: TheAudioDB real photo → Wikipedia article photo → iTunes album art
     const artistImageUrl =
-      audioDbArtist?.strArtistThumb                              // real headshot
-      ?? art(trackImgRes?.[0]?.artworkUrl100, 400)               // iTunes album art fallback
+      adbPhoto                                       // press photo from TheAudioDB
+      ?? wikiPhoto                                   // Wikipedia article thumbnail
+      ?? art(trackImgRes?.[0]?.artworkUrl100, 400)  // album art last resort
       ?? null
 
     // TrackCard image
