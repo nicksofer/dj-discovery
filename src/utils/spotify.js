@@ -123,9 +123,9 @@ export async function getSpotifyData(
 
   try {
     // ── Phase 1: images in parallel — Deezer for artist photo, iTunes for album art ──
-    const [deezerArtist, ...itunesResults] = await Promise.all([
-      // Deezer: actual artist headshot / press photo
-      fetch(`https://api.deezer.com/search/artist?q=${encodeURIComponent(mainArtistName)}&limit=1`)
+    const [audioDbResult, ...itunesResults] = await Promise.all([
+      // TheAudioDB: actual artist headshot — CORS-enabled, free, no auth
+      fetch(`https://www.theaudiodb.com/api/v1/json/2/search.php?s=${encodeURIComponent(mainArtistName)}`)
         .then(r => r.ok ? r.json() : null)
         .catch(() => null),
       // iTunes: track image (for TrackCard in track mode)
@@ -149,11 +149,10 @@ export async function getSpotifyData(
     const recRes      = itunesResults.slice(idx, (idx += nRecs))
     const simTrkRes   = itunesResults.slice(idx, (idx += nSimTrk))
 
-    // Artist photo: Deezer press photo (500x500), fall back to iTunes album art
-    const deezerMatch  = deezerArtist?.data?.[0]
+    // Artist photo: TheAudioDB headshot, fall back to iTunes album art
+    const audioDbArtist  = audioDbResult?.artists?.[0]
     const artistImageUrl =
-      deezerMatch?.picture_big                                    // 500x500 real photo
-      ?? deezerMatch?.picture_medium                              // 250x250
+      audioDbArtist?.strArtistThumb                              // real headshot
       ?? art(trackImgRes?.[0]?.artworkUrl100, 400)               // iTunes album art fallback
       ?? null
 
