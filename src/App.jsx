@@ -3,10 +3,11 @@ import SearchBar from './components/SearchBar'
 import ArtistCard from './components/ArtistCard'
 import TrackList from './components/TrackList'
 import RecommendedTracks from './components/RecommendedTracks'
-import TrendingTracks from './components/TrendingTracks'
+import MixReadyTracks from './components/MixReadyTracks'
 import SimilarArtists from './components/SimilarArtists'
 import SetBuilder from './components/SetBuilder'
-import { getBpmInfo, getMatchedGenreKeyword, sharesBpmCategory } from './utils/bpm'
+import { getBpmInfo, sharesBpmCategory } from './utils/bpm'
+import { getMixReadyTracks } from './utils/spotify'
 import './App.css'
 
 const API_KEY = import.meta.env.VITE_LASTFM_API_KEY
@@ -115,8 +116,7 @@ export default function App() {
   const [tracks, setTracks] = useState([])
   const [similar, setSimilar] = useState([])
   const [recommendations, setRecommendations] = useState([])
-  const [trending, setTrending] = useState([])
-  const [primaryGenre, setPrimaryGenre] = useState(null)
+  const [mixReady, setMixReady] = useState({ mainCamelot: null, tracks: [], loading: false })
   const [foundAs, setFoundAs] = useState(null)
   const [setList, setSetList] = useState([])
   const [loading, setLoading] = useState(false)
@@ -142,8 +142,7 @@ export default function App() {
     setTracks([])
     setSimilar([])
     setRecommendations([])
-    setTrending([])
-    setPrimaryGenre(null)
+    setMixReady({ mainCamelot: null, tracks: [], loading: false })
     setFoundAs(null)
 
     try {
@@ -155,22 +154,20 @@ export default function App() {
       const exactName = topMatch.name
       if (exactName.toLowerCase() !== name.toLowerCase()) setFoundAs(exactName)
 
-      // Step 2: fetch info, tracks, and up to 10 similar artists in parallel
-      const [infoData, tracksData, similarData] = await Promise.all([
+      // Step 2: fetch info, tracks, similar artists, and Wikipedia thumbnail in parallel
+      const [infoData, tracksData, similarData, wikiData] = await Promise.all([
         fetchLastFm('artist.getinfo', `artist=${encodeURIComponent(exactName)}`),
         fetchLastFm('artist.gettoptracks', `artist=${encodeURIComponent(exactName)}&limit=8`),
         fetchLastFm('artist.getsimilar', `artist=${encodeURIComponent(exactName)}&limit=10`),
+        fetch(`https://en.wikipedia.org/api/rest_v1/page/summary/${encodeURIComponent(exactName)}`).then(r => r.json()).catch(() => null),
       ])
 
       if (infoData.error) throw new Error('Artist not found')
 
-      const artistData = infoData.artist
+      const wikiImage = wikiData?.thumbnail?.source ?? null
+      const artistData = { ...infoData.artist, wikiImage }
       const allTags = artistData.tags?.tag?.map(t => t.name) ?? []
       const bpmInfo = getBpmInfo(allTags)
-
-      // Use our own genre keyword (from BPM map) rather than trusting Last.fm's raw first tag,
-      // which can be wildly wrong for niche or mislabelled artists.
-      const genre = getMatchedGenreKeyword(allTags) ?? allTags[0] ?? null
 
       const allSimilar = similarData.similarartists?.artist ?? []
 
@@ -196,36 +193,31 @@ export default function App() {
       //     so every result is genuinely from the same scene — not a generic genre chart.
       const similarTracksResults = await Promise.all(
         compatibleSimilar.slice(0, 6).map(a =>
-          fetchLastFm('artist.gettoptracks', `artist=${encodeURIComponent(a.name)}&limit=3`)
+          fetchLastFm('artist.gettoptracks', `artist=${encodeURIComponent(a.name)}&limit=1`)
         )
       )
 
       const recs = compatibleSimilar.slice(0, 5).map((a, i) => {
         const track = similarTracksResults[i]?.toptracks?.track?.[0]
+        const albumArt = track?.image?.find(img => img.size === 'medium')?.['#text'] || null
         return track
-          ? { artist: a.name, track: track.name, bpmRange: bpmInfo?.range ?? null }
+          ? { artist: a.name, track: track.name, bpmRange: bpmInfo?.range ?? null, albumArt }
           : null
       }).filter(Boolean)
-
-      const genrePopular = compatibleSimilar
-        .flatMap((a, i) => {
-          const tracks = similarTracksResults[i]?.toptracks?.track ?? []
-          return tracks.map(t => ({
-            artistName: a.name,
-            trackName: t.name,
-            playcount: Number(t.playcount),
-            bpmRange: bpmInfo?.range ?? null,
-          }))
-        })
-        .sort((a, b) => b.playcount - a.playcount)
-        .slice(0, 8)
 
       setArtist(artistData)
       setTracks(tracksData.toptracks?.track ?? [])
       setSimilar(compatibleSimilar)
       setRecommendations(recs)
-      setPrimaryGenre(genre)
-      setTrending(genrePopular)
+
+      // Fire Spotify key-matching asynchronously so main content renders immediately
+      const topTrackName = tracksData.toptracks?.track?.[0]?.name
+      if (topTrackName) {
+        setMixReady({ mainCamelot: null, tracks: [], loading: true })
+        getMixReadyTracks(exactName, topTrackName, compatibleSimilar)
+          .then(data => setMixReady({ ...data, loading: false }))
+          .catch(() => setMixReady({ mainCamelot: null, tracks: [], loading: false }))
+      }
     } catch (e) {
       setError(e.message)
     } finally {
@@ -274,9 +266,10 @@ export default function App() {
               onSearch={handleSearch}
               onAddToSet={addToSet}
             />
-            <TrendingTracks
-              tracks={trending}
-              genre={primaryGenre}
+            <MixReadyTracks
+              mainCamelot={mixReady.mainCamelot}
+              tracks={mixReady.tracks}
+              loading={mixReady.loading}
               onAddToSet={addToSet}
             />
             <SimilarArtists artists={similar} onSearch={handleSearch} />

@@ -1,3 +1,5 @@
+import StreamingButton from './StreamingButton'
+
 export default function TrendingTracks({ tracks, genre, onAddToSet }) {
   if (!tracks?.length || !genre) return null
 
@@ -11,6 +13,9 @@ export default function TrendingTracks({ tracks, genre, onAddToSet }) {
         {tracks.map((track, i) => (
           <li key={`${track.artistName}-${track.trackName}`} className="track-item">
             <span className="track-number">{i + 1}</span>
+            {track.albumArt
+              ? <img src={track.albumArt} alt="" className="track-thumb" />
+              : <div className="track-thumb-placeholder" />}
             <div className="rec-track-info">
               <span className="track-name">{track.trackName}</span>
               <span className="rec-artist-name">{track.artistName}</span>
@@ -18,6 +23,7 @@ export default function TrendingTracks({ tracks, genre, onAddToSet }) {
             <span className="track-plays">
               {track.playcount?.toLocaleString()} plays
             </span>
+            <StreamingButton trackName={track.trackName} artistName={track.artistName} />
             <button
               className="add-to-set-btn"
               onClick={() => onAddToSet({ trackName: track.trackName, artistName: track.artistName, bpmRange: track.bpmRange })}

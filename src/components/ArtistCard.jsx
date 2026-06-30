@@ -21,7 +21,7 @@ function getGenreDna(tags) {
 }
 
 export default function ArtistCard({ artist }) {
-  const image = artist.image?.find(i => i.size === 'extralarge')?.['#text']
+  const image = artist.wikiImage || artist.image?.find(i => i.size === 'extralarge')?.['#text'] || null
   const allTags = artist.tags?.tag?.map(t => t.name) ?? []
   const genres = allTags.slice(0, 4)
   const listeners = artist.stats?.listeners
